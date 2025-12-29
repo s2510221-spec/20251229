@@ -8,6 +8,7 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
 from scipy.spatial import cKDTree
 import numpy as np
+import os  # <--- 이 부분이 추가되었습니다.
 
 # ---------------------------------------------------------
 # 1. 설정 및 데이터 로드
@@ -20,21 +21,15 @@ def load_data(file_path):
     사용자의 도로 안전 데이터를 로드합니다.
     파일이 없을 경우를 대비한 예외처리가 포함되어 있습니다.
     """
+    # os 모듈이 import 되어 있어야 이 줄이 작동합니다.
     if not os.path.exists(file_path):
-        st.error(f"데이터 파일({file_path})을 찾을 수 없습니다. 같은 폴더에 위치시켜주세요.")
-        # 테스트를 위한 더미 데이터 생성 (실제 배포시 삭제 가능)
-        return pd.DataFrame({
-            'lat': [37.5665, 37.5660, 37.5700], 
-            'lon': [126.9780, 126.9800, 126.9750], 
-            'risk_score': [80, 20, 50],
-            'desc': ['사고 다발 구간', '안전 구간', '주의 구간']
-        })
+        st.error(f"데이터 파일({file_path})을 찾을 수 없습니다. 프로젝트 폴더(app.py와 같은 위치)에 파일을 넣어주세요.")
+        # 파일이 없을 때 앱이 멈추지 않도록 빈 데이터프레임 반환
+        return pd.DataFrame()
     
     try:
         df = pd.read_csv(file_path)
-        # 컬럼명 매핑 (사용자의 CSV 컬럼명에 맞게 수정 필요)
-        # 예: 만약 CSV에 '위도', '경도'로 되어있다면 rename 필요
-        # df = df.rename(columns={'위도': 'lat', '경도': 'lon', '위험도': 'risk_score'})
+        # CSV 파일 로드 성공
         return df
     except Exception as e:
         st.error(f"데이터 로드 중 오류 발생: {e}")
@@ -97,26 +92,37 @@ def match_risk_data(G, route, risk_df):
         node = G.nodes[node_id]
         route_nodes.append((node['y'], node['x'])) # lat, lon
 
+    # 데이터프레임 컬럼 확인 및 매핑 (사용자 데이터에 맞게 조정 필요)
+    # 기본적으로 'lat', 'lon', 'risk_score' 컬럼이 있다고 가정
+    # 만약 에러가 난다면 이 부분에서 컬럼명을 확인해야 합니다.
+    lat_col = 'lat'
+    lon_col = 'lon'
+    risk_col = 'risk_score'
+    desc_col = 'desc'
+
+    # CSV에 해당 컬럼이 있는지 확인
+    if lat_col not in risk_df.columns or lon_col not in risk_df.columns:
+        # 컬럼이 없을 경우 매칭하지 않고 빈 리스트 반환 (에러 방지)
+        return []
+
     # CSV 데이터 좌표 KDTree 생성 (빠른 검색용)
-    if 'lat' in risk_df.columns and 'lon' in risk_df.columns:
-        data_coords = list(zip(risk_df['lat'], risk_df['lon']))
-        tree = cKDTree(data_coords)
-        
-        route_risks = []
-        # 각 경로 포인트에서 가장 가까운 위험 데이터 찾기 (반경 50m 이내)
-        dists, idxs = tree.query(route_nodes, k=1, distance_upper_bound=0.0005) # 약 50m
-        
-        for i, (dist, idx) in enumerate(zip(dists, idxs)):
-            if dist != float('inf'): # 매칭된 데이터가 있으면
-                info = risk_df.iloc[idx]
-                route_risks.append({
-                    'lat': route_nodes[i][0],
-                    'lon': route_nodes[i][1],
-                    'risk': info.get('risk_score', 0),
-                    'desc': info.get('desc', '정보 없음')
-                })
-        return route_risks
-    return []
+    data_coords = list(zip(risk_df[lat_col], risk_df[lon_col]))
+    tree = cKDTree(data_coords)
+    
+    route_risks = []
+    # 각 경로 포인트에서 가장 가까운 위험 데이터 찾기 (반경 50m 이내)
+    dists, idxs = tree.query(route_nodes, k=1, distance_upper_bound=0.0005) # 약 50m
+    
+    for i, (dist, idx) in enumerate(zip(dists, idxs)):
+        if dist != float('inf'): # 매칭된 데이터가 있으면
+            info = risk_df.iloc[idx]
+            route_risks.append({
+                'lat': route_nodes[i][0],
+                'lon': route_nodes[i][1],
+                'risk': info.get(risk_col, 0),
+                'desc': info.get(desc_col, '정보 없음')
+            })
+    return route_risks
 
 # ---------------------------------------------------------
 # 3. UI 및 메인 로직
