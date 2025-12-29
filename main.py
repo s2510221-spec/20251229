@@ -9,70 +9,86 @@ from scipy.spatial import cKDTree
 import os
 
 # ---------------------------------------------------------
-# 1. 설정 및 데이터 로드
+# 1. 설정 및 데이터 로드 (강력해진 버전)
 # ---------------------------------------------------------
 st.set_page_config(page_title="안전 경로 네비게이터", layout="wide")
 
 @st.cache_data
 def load_data(file_path):
     """
-    사용자의 도로 안전 데이터를 로드합니다.
-    한글 깨짐 방지 및 컬럼 매핑 로직이 포함되어 있습니다.
+    데이터 로드 및 컬럼 자동 찾기 기능이 포함된 함수
     """
     if not os.path.exists(file_path):
-        st.error(f"데이터 파일({file_path})을 찾을 수 없습니다.")
+        st.error(f"❌ 파일이 없습니다: {file_path}")
         return pd.DataFrame()
     
     df = pd.DataFrame()
-    # 1. 인코딩 시도 (한글 CSV는 cp949 또는 euc-kr인 경우가 많음)
-    try:
-        df = pd.read_csv(file_path, encoding='cp949')
-    except UnicodeDecodeError:
+    
+    # 1. 인코딩 자동 감지 시도
+    encodings = ['cp949', 'utf-8', 'euc-kr']
+    for enc in encodings:
         try:
-            df = pd.read_csv(file_path, encoding='utf-8')
+            df = pd.read_csv(file_path, encoding=enc)
+            # 성공하면 반복문 탈출
+            break 
+        except UnicodeDecodeError:
+            continue
         except Exception as e:
-            st.error(f"파일 인코딩 오류: {e}")
+            st.error(f"파일 읽기 오류 ({enc}): {e}")
             return pd.DataFrame()
-    except Exception as e:
-        st.error(f"데이터 로드 중 알 수 없는 오류: {e}")
+
+    if df.empty:
+        st.error("❌ 파일을 읽었으나 데이터가 비어있거나, 인코딩 문제로 읽지 못했습니다.")
         return pd.DataFrame()
 
-    # 2. 컬럼명 공백 제거 (예: ' 노드명 ' -> '노드명')
-    df.columns = df.columns.str.strip()
+    # 2. 컬럼 이름 정리 (공백 제거 및 소문자 변환)
+    # 예: ' 위도 ' -> '위도', 'LAT ' -> 'lat'
+    df.columns = df.columns.str.strip().str.lower()
 
-    # 3. 필수 컬럼 확인 및 이름 통일
-    # 사용자가 요청한 '노드명'을 'desc'로, '위도'/'경도'를 'lat'/'lon'으로 매핑
-    
-    # (1) 장소 이름 매핑
-    if '노드명' in df.columns:
-        df['desc'] = df['노드명']
-    elif 'desc' not in df.columns:
-        # 노드명이 없으면 첫 번째 문자열 컬럼을 사용하거나 임의 생성
-        st.warning("'노드명' 컬럼을 찾을 수 없어 임시 이름을 생성합니다.")
-        df['desc'] = df.index.astype(str) + "_지점"
+    # 디버깅용: 사용자가 컬럼명을 확인할 수 있게 출력 (사이드바)
+    with st.sidebar.expander("🛠️ 파일 컬럼명 확인 (디버깅)"):
+        st.write("읽어온 파일의 컬럼 목록:")
+        st.write(df.columns.tolist())
 
-    # (2) 위도 매핑
-    if 'lat' not in df.columns:
-        if '위도' in df.columns:
-            df['lat'] = df['위도']
-        else:
-            st.error("CSV 파일에 '위도' 또는 'lat' 컬럼이 없습니다.")
-            return pd.DataFrame()
+    # 3. 유연하게 컬럼 찾기 함수
+    def find_column(candidates, columns):
+        for col in columns:
+            for cand in candidates:
+                # 정확히 일치하거나, 해당 단어가 포함되어 있으면 선택
+                if cand == col or cand in col:
+                    return col
+        return None
 
-    # (3) 경도 매핑
-    if 'lon' not in df.columns:
-        if '경도' in df.columns:
-            df['lon'] = df['경도']
-        else:
-            st.error("CSV 파일에 '경도' 또는 'lon' 컬럼이 없습니다.")
-            return pd.DataFrame()
+    # (1) 위도 찾기 (lat, latitude, 위도, y 등)
+    lat_col = find_column(['lat', 'latitude', '위도', 'y좌표', 'y'], df.columns)
+    if lat_col:
+        df['lat'] = df[lat_col]
+    else:
+        st.error(f"❌ '위도' 정보를 찾을 수 없습니다. (현재 컬럼: {df.columns.tolist()})")
+        return pd.DataFrame()
 
-    # (4) 위험도 매핑 (없으면 0으로 처리)
-    if 'risk_score' not in df.columns:
-        if '위험도' in df.columns:
-            df['risk_score'] = df['위험도']
-        else:
-            df['risk_score'] = 0 # 기본값
+    # (2) 경도 찾기 (lon, lng, longitude, 경도, x 등)
+    lon_col = find_column(['lon', 'lng', 'longitude', '경도', 'x좌표', 'x'], df.columns)
+    if lon_col:
+        df['lon'] = df[lon_col]
+    else:
+        st.error(f"❌ '경도' 정보를 찾을 수 없습니다. (현재 컬럼: {df.columns.tolist()})")
+        return pd.DataFrame()
+
+    # (3) 노드명(장소명) 찾기
+    desc_col = find_column(['노드명', '장소명', 'name', 'place', 'desc', '지점'], df.columns)
+    if desc_col:
+        df['desc'] = df[desc_col]
+    else:
+        # 없으면 인덱스를 사용하여 임시 이름 생성
+        df['desc'] = "지점_" + df.index.astype(str)
+
+    # (4) 위험도 찾기
+    risk_col = find_column(['risk', 'score', '위험도', '점수', '등급'], df.columns)
+    if risk_col:
+        df['risk_score'] = df[risk_col].fillna(0) # 결측치는 0으로
+    else:
+        df['risk_score'] = 0 # 없으면 모두 0점 처리
 
     return df
 
@@ -84,10 +100,7 @@ risk_data = load_data(DATA_FILE)
 # 2. 유틸리티 함수
 # ---------------------------------------------------------
 def get_coordinates_from_data(location_name, df):
-    """선택한 '노드명'에 해당하는 좌표 반환"""
-    if df.empty:
-        return None
-    
+    if df.empty: return None
     row = df[df['desc'] == location_name]
     if not row.empty:
         return row.iloc[0]['lat'], row.iloc[0]['lon']
@@ -95,7 +108,6 @@ def get_coordinates_from_data(location_name, df):
 
 @st.cache_resource
 def get_graph(start_coords, end_coords, mode):
-    """도로망 그래프 다운로드 (Bbox)"""
     # 범위 설정
     margin = 0.015
     north = max(start_coords[0], end_coords[0]) + margin
@@ -112,9 +124,7 @@ def get_graph(start_coords, end_coords, mode):
         return None
 
 def match_risk_data(G, route, risk_df):
-    """경로 주변 위험 데이터 매칭"""
-    if risk_df.empty or route is None:
-        return []
+    if risk_df.empty or route is None: return []
 
     route_nodes = []
     for node_id in route:
@@ -144,22 +154,21 @@ def match_risk_data(G, route, risk_df):
 # ---------------------------------------------------------
 st.title("🚗🛡️ 안전 경로 네비게이터 (South Korea)")
 
-# 데이터 로드 상태 확인 (디버깅용)
 if risk_data.empty:
-    st.error("데이터를 불러오지 못했습니다. CSV 파일을 확인해주세요.")
+    st.warning("⚠️ 데이터를 불러오지 못해 앱을 실행할 수 없습니다. 위의 에러 메시지와 왼쪽 사이드바의 컬럼명을 확인해주세요.")
 else:
     # 사이드바 설정
     st.sidebar.header("경로 설정")
     mode = st.sidebar.radio("이동 수단", ["자동차 모드", "보행자 모드"])
 
-    # '노드명' 리스트 추출 (중복 제거)
-    location_list = sorted(risk_data['desc'].unique().tolist())
+    # 장소 목록 (가나다순 정렬)
+    # 데이터가 모두 문자열인지 확인 후 정렬
+    location_list = sorted(risk_data['desc'].astype(str).unique().tolist())
     
     st.sidebar.subheader("출발/도착지 선택")
     
-    # 목록이 하나만 뜨는 경우를 대비해 예외 처리
     if len(location_list) < 2:
-        st.sidebar.warning("데이터에 등록된 지역(노드명)이 2개 미만입니다.")
+        st.sidebar.warning(f"장소가 {len(location_list)}개 뿐입니다. 최소 2개가 필요합니다.")
         start_select = st.sidebar.selectbox("출발지", location_list)
         end_select = start_select
     else:
@@ -168,9 +177,9 @@ else:
 
     search_btn = st.sidebar.button("경로 탐색 시작")
 
-    # 데이터 미리보기 (제대로 읽혔는지 확인용, 필요 시 주석 처리 가능)
-    with st.expander("📊 로드된 데이터 확인하기 (클릭)"):
-        st.dataframe(risk_data.head())
+    # 데이터 미리보기 (제대로 매핑되었는지 확인)
+    with st.expander("📊 로드된 데이터 및 매핑 결과 확인"):
+        st.dataframe(risk_data[['desc', 'lat', 'lon', 'risk_score']].head())
 
     # 경로 탐색 로직
     if search_btn:
@@ -228,8 +237,8 @@ else:
                             st_folium(m, width=800, height=500)
 
                         except nx.NetworkXNoPath:
-                            st.error("경로를 찾을 수 없습니다.")
+                            st.error("경로를 찾을 수 없습니다. (도로 연결 끊김)")
                         except Exception as e:
-                            st.error(f"오류: {e}")
+                            st.error(f"지도 처리 오류: {e}")
                     else:
                         st.error("지도 데이터를 불러올 수 없습니다.")
