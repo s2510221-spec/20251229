@@ -3,144 +3,151 @@ import pandas as pd
 import folium
 from streamlit_folium import st_folium
 from pyproj import Transformer
-
-# 페이지 설정
-st.set_page_config(page_title="경로 탐색 및 지도 보기", layout="wide")
-
-st.title("🗺️ 경로 탐색 및 지도 시각화")
-st.write("파일을 업로드하고 출발지와 도착지를 선택하면, 거리 제한 없이 지도를 보여줍니다.")
+import os
 
 # -----------------------------------------------------------------------------
-# 1. 좌표 변환기 설정 (핵심 수정 사항)
+# 1. 기본 설정 및 파일명 지정
 # -----------------------------------------------------------------------------
-# 한국 공공데이터(도로명주소 등)는 보통 'EPSG:5179' 좌표계를 씁니다.
-# 만약 지도가 엉뚱한 곳(바다, 중국 등)을 가리키면 'epsg:5174' 또는 'epsg:5186'으로 바꿔보세요.
+st.set_page_config(page_title="경로 탐색 시스템", layout="wide")
+st.title("🗺️ 도로 경로 탐색 시스템")
+
+# 깃허브(같은 폴더)에 있는 파일명
+CSV_FILE_NAME = '20251229road_29최종.csv'
+
+# -----------------------------------------------------------------------------
+# 2. 좌표 변환기 설정 (TM좌표 -> 위도/경도)
+# -----------------------------------------------------------------------------
+# 한국 도로명주소/공공데이터는 보통 'EPSG:5179'를 사용합니다.
+# 만약 지도가 엉뚱한 위치(바다 등)에 찍히면 'epsg:5174'로 변경해보세요.
 try:
     transformer = Transformer.from_crs("epsg:5179", "epsg:4326")
 except Exception as e:
-    st.error(f"좌표 변환기 설정 오류: {e}")
+    st.error(f"좌표 변환 모듈 설정 실패: {e}")
     st.stop()
 
 def get_lat_lon(x, y):
     """
-    TM좌표(미터 단위)를 위도(lat), 경도(lon)로 변환하는 함수
+    TM좌표(미터 단위)를 위도(lat), 경도(lon)로 변환
     """
     try:
-        # pyproj transform은 보통 (y, x) 순서로 넣으면 (lat, lon)이 나옵니다.
+        # pyproj transform은 (y, x) 순서로 넣으면 (lat, lon)이 반환됩니다.
         lat, lon = transformer.transform(y, x)
         return lat, lon
-    except Exception as e:
+    except:
         return None, None
 
 # -----------------------------------------------------------------------------
-# 2. 파일 업로드 및 데이터 로드
+# 3. 데이터 로드 (자동 읽기)
 # -----------------------------------------------------------------------------
-uploaded_file = st.file_uploader("엑셀 또는 CSV 파일을 업로드하세요", type=['xlsx', 'csv'])
-
-if uploaded_file is not None:
-    # 파일 확장자에 따라 읽기
-    if uploaded_file.name.endswith('.csv'):
-        df = pd.read_csv(uploaded_file, encoding='cp949') # 한글 깨짐 방지
-    else:
-        df = pd.read_excel(uploaded_file)
-        
-    st.write("### 데이터 미리보기")
-    st.dataframe(df.head())
-
-    # -------------------------------------------------------------------------
-    # 3. 컬럼 선택 (사용자가 직접 좌표 컬럼을 지정하게 함)
-    # -------------------------------------------------------------------------
-    st.sidebar.header("설정")
+@st.cache_data  # 데이터 로딩 속도 향상을 위해 캐시 사용
+def load_data(file_path):
+    if not os.path.exists(file_path):
+        return None
     
-    # 데이터프레임의 컬럼 목록
+    # 한글 파일은 보통 cp949 또는 euc-kr 인코딩
+    try:
+        df = pd.read_csv(file_path, encoding='cp949')
+    except:
+        df = pd.read_csv(file_path, encoding='utf-8') # utf-8 시도
+    return df
+
+# 파일 불러오기 시도
+df = load_data(CSV_FILE_NAME)
+
+if df is None:
+    st.error(f"❌ '{CSV_FILE_NAME}' 파일을 찾을 수 없습니다.")
+    st.warning("GitHub 리포지토리에 파일이 정확한 이름으로 업로드되어 있는지 확인해주세요.")
+    st.stop()
+else:
+    st.success(f"📂 데이터 파일 로드 완료: {CSV_FILE_NAME}")
+    
+    # 데이터 미리보기 (접기 가능)
+    with st.expander("데이터 미리보기"):
+        st.dataframe(df.head())
+
+    # -------------------------------------------------------------------------
+    # 4. 컬럼 매핑 (자동으로 읽었더라도 어떤 게 좌표인지 지정 필요)
+    # -------------------------------------------------------------------------
+    st.sidebar.header("🔧 설정")
+    st.sidebar.info("데이터의 어떤 컬럼이 장소명과 좌표인지 선택해주세요.")
+    
     columns = df.columns.tolist()
     
-    # 장소 이름, X좌표, Y좌표 컬럼을 사용자가 선택
-    name_col = st.sidebar.selectbox("장소명 컬럼 선택", columns, index=0)
-    x_col = st.sidebar.selectbox("X 좌표(경도) 컬럼 선택", columns, index=1 if len(columns)>1 else 0)
-    y_col = st.sidebar.selectbox("Y 좌표(위도) 컬럼 선택", columns, index=2 if len(columns)>2 else 0)
+    # 기본적으로 '장소', '명칭', 'X', 'Y' 같은 단어가 포함된 컬럼을 자동으로 찾으려 시도
+    default_name_idx = next((i for i, c in enumerate(columns) if '명' in c or '장소' in c), 0)
+    default_x_idx = next((i for i, c in enumerate(columns) if 'X' in c or 'x' in c or '경도' in c), 1)
+    default_y_idx = next((i for i, c in enumerate(columns) if 'Y' in c or 'y' in c or '위도' in c), 2)
+
+    name_col = st.sidebar.selectbox("장소명(이름) 컬럼", columns, index=default_name_idx)
+    x_col = st.sidebar.selectbox("X좌표 컬럼 (TM X)", columns, index=default_x_idx)
+    y_col = st.sidebar.selectbox("Y좌표 컬럼 (TM Y)", columns, index=default_y_idx)
 
     # -------------------------------------------------------------------------
-    # 4. 출발지 / 도착지 선택
+    # 5. 경로 탐색 UI
     # -------------------------------------------------------------------------
-    st.subheader("📍 출발지와 도착지 선택")
+    st.divider()
+    col1, col2, col3 = st.columns([1, 1, 1])
     
-    col1, col2 = st.columns(2)
     with col1:
-        start_place = st.selectbox("출발지 선택", df[name_col].unique(), key='start')
+        start_place = st.selectbox("출발지 선택", df[name_col].unique())
     with col2:
-        end_place = st.selectbox("도착지 선택", df[name_col].unique(), key='end')
+        end_place = st.selectbox("도착지 선택", df[name_col].unique())
+    with col3:
+        st.write("") # 여백용
+        st.write("") 
+        search_btn = st.button("🚀 경로 탐색 시작", use_container_width=True)
 
-    # 선택한 장소의 행(Row) 데이터 가져오기
-    start_row = df[df[name_col] == start_place].iloc[0]
-    end_row = df[df[name_col] == end_place].iloc[0]
+    # -------------------------------------------------------------------------
+    # 6. 지도 시각화 (버튼 클릭 시)
+    # -------------------------------------------------------------------------
+    if search_btn:
+        # 선택한 장소의 데이터 행 추출
+        start_row = df[df[name_col] == start_place].iloc[0]
+        end_row = df[df[name_col] == end_place].iloc[0]
 
-    # 경로 탐색 버튼
-    if st.button("경로 탐색 및 지도 보기"):
-        
-        # ---------------------------------------------------------------------
-        # 5. 좌표 변환 및 지도 그리기 (에러 해결 부분)
-        # ---------------------------------------------------------------------
-        
-        # 원본 좌표 (큰 숫자)
+        # 원본 좌표 가져오기 (파일에 있는 큰 숫자)
         sx_raw, sy_raw = start_row[x_col], start_row[y_col]
         ex_raw, ey_raw = end_row[x_col], end_row[y_col]
-        
-        # [중요] 좌표 변환 수행 (TM -> 위경도)
+
+        # 좌표 변환 (핵심!)
         start_lat, start_lon = get_lat_lon(sx_raw, sy_raw)
         end_lat, end_lon = get_lat_lon(ex_raw, ey_raw)
 
-        # 변환 성공 여부 확인
         if start_lat is None or end_lat is None:
-            st.error("좌표 변환에 실패했습니다. 올바른 숫자 데이터인지 확인해주세요.")
+            st.error("좌표 변환 실패: 좌표 데이터가 숫자가 아니거나 형식이 잘못되었습니다.")
         else:
-            # 거리 계산 로직 (에러를 내는 대신 정보만 보여줌)
-            st.success(f"✅ 경로 탐색 성공! (거리 제한 없음)")
-            st.info(f"변환된 좌표 - 출발: ({start_lat:.5f}, {start_lon:.5f}) / 도착: ({end_lat:.5f}, {end_lon:.5f})")
-
-            # 지도 중심 잡기 (중간 지점)
+            # 중심점 계산
             center_lat = (start_lat + end_lat) / 2
             center_lon = (start_lon + end_lon) / 2
-            
+
             # 지도 생성
             m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
 
-            # 출발지 마커 (파란색)
+            # 출발지 마커
             folium.Marker(
                 [start_lat, start_lon],
-                tooltip=start_place,
                 popup=f"출발: {start_place}",
+                tooltip=start_place,
                 icon=folium.Icon(color="blue", icon="play")
             ).add_to(m)
 
-            # 도착지 마커 (빨간색)
+            # 도착지 마커
             folium.Marker(
                 [end_lat, end_lon],
-                tooltip=end_place,
                 popup=f"도착: {end_place}",
+                tooltip=end_place,
                 icon=folium.Icon(color="red", icon="stop")
             ).add_to(m)
 
-            # 경로 선 그리기
+            # 선 그리기
             folium.PolyLine(
                 locations=[[start_lat, start_lon], [end_lat, end_lon]],
                 color="blue",
-                weight=4,
+                weight=5,
                 opacity=0.7
             ).add_to(m)
 
-            # Streamlit에 지도 출력
+            st.success("경로 탐색 완료!")
+            
+            # 지도 출력
             st_folium(m, width=800, height=500)
-
-else:
-    st.info("좌측(또는 상단)에서 엑셀/CSV 데이터를 업로드해주세요.")
-    
-    # (테스트용) 파일 없을 때 예시 데이터 생성 로직
-    st.divider()
-    st.write("🔍 **테스트용 데이터 예시 (업로드할 파일 형식이 이래야 합니다)**")
-    dummy_data = {
-        '장소명': ['서울역', '강남역', '인천공항'],
-        'X좌표': [953928.1234, 959321.5678, 928321.1111], # 예시 TM좌표
-        'Y좌표': [1951023.4321, 1944123.9876, 1948321.2222]
-    }
-    st.dataframe(pd.DataFrame(dummy_data))
