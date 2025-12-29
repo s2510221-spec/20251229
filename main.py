@@ -6,17 +6,17 @@ from pyproj import Transformer
 import os
 
 # -----------------------------------------------------------------------------
-# 1. 기본 설정
+# 1. 페이지 설정
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="스마트 경로 탐색", layout="wide")
-st.title("🗺️ 자동 보정 경로 탐색 시스템")
-st.write("복잡한 설정 없이 출발/도착지만 선택하세요. 시스템이 자동으로 한국 위치를 찾아냅니다.")
+st.set_page_config(page_title="위치 자동 보정 시스템", layout="wide")
+st.title("🗺️ 강력한 자동 보정 경로 탐색")
+st.write("바다에 뜨지 않도록 대한민국 내 모든 좌표계를 자동으로 대조하여 정확한 위치를 찾습니다.")
 
-# 깃허브(같은 폴더)에 있는 파일명
+# 파일명 (수정 필요시 변경)
 CSV_FILE_NAME = '20251229road_29최종.csv'
 
 # -----------------------------------------------------------------------------
-# 2. Session State (지도 유지용)
+# 2. 상태 저장 (지도 유지용)
 # -----------------------------------------------------------------------------
 if 'map_view' not in st.session_state:
     st.session_state['map_view'] = False
@@ -26,35 +26,42 @@ if 'e_place' not in st.session_state:
     st.session_state['e_place'] = None
 
 # -----------------------------------------------------------------------------
-# 3. "스마트" 좌표 변환 로직 (핵심 수정 부분)
+# 3. [핵심] 강력한 좌표 자동 변환 함수
 # -----------------------------------------------------------------------------
-# 한국에서 가장 많이 쓰는 두 가지 좌표계 미리 준비
-trans_5179 = Transformer.from_crs("epsg:5179", "epsg:4326") # 도로명/공공데이터
-trans_5174 = Transformer.from_crs("epsg:5174", "epsg:4326") # 구 지적도
+# 대한민국에서 쓰이는 거의 모든 좌표계 리스트
+crs_list = [
+    "epsg:5179", # 도로명/네이버지도 (가장 흔함)
+    "epsg:5174", # 구 지적도/다음지도 구버전
+    "epsg:5181", # 카카오맵 (중부원점)
+    "epsg:5186", # 공공데이터 (GRS80)
+    "epsg:5187", # 동부원점
+    "epsg:5178"  # K-1985
+]
 
-def get_best_korea_location(x, y):
-    """
-    들어온 x, y 숫자를 가지고 5179도 적용해보고 5174도 적용해봅니다.
-    변환된 결과가 '대한민국 영역(위도 33~39, 경도 124~132)' 안에 들어오면
-    그 값을 즉시 반환합니다. (자동 감지)
-    """
-    candidates = [
-        (trans_5179, y, x),  # 1순위: 5179 정방향 (가장 흔함)
-        (trans_5174, y, x),  # 2순위: 5174 정방향 (옛날 데이터)
-        (trans_5179, x, y),  # 3순위: 5179 뒤집힘 (X,Y 바뀐 경우)
-        (trans_5174, x, y),  # 4순위: 5174 뒤집힘
-    ]
+# 변환기들을 미리 딕셔너리로 준비
+transformers = {crs: Transformer.from_crs(crs, "epsg:4326") for crs in crs_list}
 
-    for transformer, val1, val2 in candidates:
+def find_exact_korea_location(x, y):
+    """
+    입력된 x, y 숫자를 가능한 모든 좌표계와 순서(x,y / y,x)로 변환해보고
+    '대한민국 영토' 안에 들어오는 정확한 값을 찾아냅니다.
+    """
+    for crs_name, transformer in transformers.items():
+        # Case 1: (y, x) 순서 (pyproj 기본)
         try:
-            lat, lon = transformer.transform(val1, val2)
-            # 대한민국 유효 범위 체크 (위도 33~39, 경도 124~133)
-            if 33.0 < lat < 39.0 and 124.0 < lon < 133.0:
-                return lat, lon # 한국 땅 위에 떨어지면 바로 채택!
-        except:
-            continue
+            lat, lon = transformer.transform(y, x)
+            if 33.0 < lat < 38.9 and 124.5 < lon < 132.0:
+                return lat, lon # 찾았다!
+        except: pass
+
+        # Case 2: (x, y) 순서 (데이터가 뒤집힌 경우)
+        try:
+            lat, lon = transformer.transform(x, y)
+            if 33.0 < lat < 38.9 and 124.5 < lon < 132.0:
+                return lat, lon # 찾았다!
+        except: pass
             
-    return None, None # 맞는 좌표계를 못 찾음
+    return None, None # 실패
 
 # -----------------------------------------------------------------------------
 # 4. 데이터 로드
@@ -64,81 +71,74 @@ def load_data(file_path):
     if not os.path.exists(file_path):
         return None
     try:
-        df = pd.read_csv(file_path, encoding='cp949')
+        return pd.read_csv(file_path, encoding='cp949')
     except:
-        df = pd.read_csv(file_path, encoding='utf-8')
-    return df
+        return pd.read_csv(file_path, encoding='utf-8')
 
 df = load_data(CSV_FILE_NAME)
 
 if df is None:
-    st.error(f"❌ 파일을 찾을 수 없습니다: {CSV_FILE_NAME}")
+    st.error(f"❌ '{CSV_FILE_NAME}' 파일을 찾을 수 없습니다.")
     st.stop()
 
 # -----------------------------------------------------------------------------
-# 5. 컬럼 자동 매핑 (설정창 없앰)
+# 5. 컬럼 자동 매핑 (설정창 없음)
 # -----------------------------------------------------------------------------
-columns = df.columns.tolist()
+cols = df.columns.tolist()
 
-# 이름, X, Y가 들어간 컬럼을 코드가 알아서 찾습니다.
-name_col = next((c for c in columns if '명' in c or '장소' in c), columns[0])
-x_col = next((c for c in columns if 'X' in c or 'x' in c or '경도' in c), columns[1])
-y_col = next((c for c in columns if 'Y' in c or 'y' in c or '위도' in c), columns[2])
+# 이름, X, Y 컬럼 추측
+name_col = next((c for c in cols if '명' in c or '장소' in c), cols[0])
+x_col = next((c for c in cols if 'X' in c or 'x' in c or '경도' in c), cols[1])
+y_col = next((c for c in cols if 'Y' in c or 'y' in c or '위도' in c), cols[2])
 
 # -----------------------------------------------------------------------------
-# 6. 사용자 선택 UI
+# 6. UI 구성
 # -----------------------------------------------------------------------------
 st.divider()
-col1, col2, col3 = st.columns([1, 1, 1])
+c1, c2, c3 = st.columns([1, 1, 1])
 
-with col1:
-    input_start = st.selectbox("출발지", df[name_col].unique())
-with col2:
-    input_end = st.selectbox("도착지", df[name_col].unique())
-with col3:
+with c1:
+    in_start = st.selectbox("출발지", df[name_col].unique())
+with c2:
+    in_end = st.selectbox("도착지", df[name_col].unique())
+with c3:
     st.write("") 
     st.write("") 
-    # 버튼 클릭
-    if st.button("🚀 경로 탐색 (자동 보정)", use_container_width=True):
+    if st.button("🚀 경로 탐색", use_container_width=True):
         st.session_state['map_view'] = True
-        st.session_state['s_place'] = input_start
-        st.session_state['e_place'] = input_end
+        st.session_state['s_place'] = in_start
+        st.session_state['e_place'] = in_end
 
 # -----------------------------------------------------------------------------
-# 7. 지도 그리기
+# 7. 지도 출력 로직
 # -----------------------------------------------------------------------------
 if st.session_state['map_view']:
-    s_place = st.session_state['s_place']
-    e_place = st.session_state['e_place']
-    
     try:
-        # 데이터 찾기
-        s_row = df[df[name_col] == s_place].iloc[0]
-        e_row = df[df[name_col] == e_place].iloc[0]
-        
-        # [자동 변환 함수 사용]
-        slat, slon = get_best_korea_location(s_row[x_col], s_row[y_col])
-        elat, elon = get_best_korea_location(e_row[x_col], e_row[y_col])
+        s_val = st.session_state['s_place']
+        e_val = st.session_state['e_place']
 
-        # 변환 결과 확인
+        s_row = df[df[name_col] == s_val].iloc[0]
+        e_row = df[df[name_col] == e_val].iloc[0]
+
+        # [자동 변환 실행]
+        slat, slon = find_exact_korea_location(s_row[x_col], s_row[y_col])
+        elat, elon = find_exact_korea_location(e_row[x_col], e_row[y_col])
+
         if slat is None or elat is None:
-            st.error("⚠️ 좌표 변환 실패: 데이터가 대한민국 좌표 범위를 벗어납니다.")
+            st.error("⚠️ 좌표 변환 실패: 어떤 좌표계를 써도 한국 위치가 나오지 않습니다. 데이터 숫자를 확인해주세요.")
         else:
-            # 지도 중심
-            center_lat = (slat + elat) / 2
-            center_lon = (slon + elon) / 2
+            # 중심점
+            center_lat, center_lon = (slat + elat) / 2, (slon + elon) / 2
             
             m = folium.Map(location=[center_lat, center_lon], zoom_start=11)
 
-            # 출발/도착 마커
-            folium.Marker([slat, slon], popup=f"출발: {s_place}", icon=folium.Icon(color="blue", icon="play")).add_to(m)
-            folium.Marker([elat, elon], popup=f"도착: {e_place}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
-            
-            # 경로 선
-            folium.PolyLine([[slat, slon], [elat, elon]], color="blue", weight=5, opacity=0.7).add_to(m)
+            # 마커 및 선
+            folium.Marker([slat, slon], popup=f"출발: {s_val}", icon=folium.Icon(color="blue", icon="play")).add_to(m)
+            folium.Marker([elat, elon], popup=f"도착: {e_val}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
+            folium.PolyLine([[slat, slon], [elat, elon]], color="blue", weight=5).add_to(m)
 
-            st.success(f"✅ 위치 확인 완료! (자동으로 좌표계를 보정하여 한국 위치를 찾았습니다)")
+            st.success("✅ 위치 보정 완료! 정확한 지도 위치를 찾았습니다.")
             st_folium(m, width=800, height=500)
-
+            
     except Exception as e:
-        st.error(f"시스템 오류: {e}")
+        st.error(f"에러 발생: {e}")
