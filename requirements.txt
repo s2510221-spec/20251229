@@ -1,8 +1,9 @@
 streamlit
 pandas
-osmnx
-networkx
 folium
 streamlit-folium
+requests
 geopy
+pyproj
+shapely
 scipy
