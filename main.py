@@ -5,211 +5,171 @@ from streamlit_folium import st_folium
 import math
 
 # ---------------------------------------------------------
-# 1. 페이지 기본 설정 및 제목
+# 1. 페이지 설정
 # ---------------------------------------------------------
-st.set_page_config(layout="wide", page_title="SafeRoad - 데이터 기반 경로 탐색")
+st.set_page_config(layout="wide", page_title="SafeRoad - 안전 경로 탐색")
 
 st.title("🚗 SafeRoad: 데이터 기반 안전 경로 탐색")
-st.markdown("""
-보유한 데이터 내에서 **출발지**와 **도착지**를 선택하여 최단 경로와 안전 정보를 확인하세요.
-""")
+st.markdown("데이터 파일 내의 장소를 선택하여 최단 경로와 안전 정보를 확인합니다.")
 
 # ---------------------------------------------------------
-# 2. 데이터 로드 및 전처리
+# 2. 데이터 로드 및 전처리 (오류 수정 핵심 부분)
 # ---------------------------------------------------------
 @st.cache_data
 def load_data():
+    file_path = '20251229road_최종.csv'
+    df = pd.DataFrame()
+    
+    # 1. 파일 읽기 (인코딩 자동 감지 시도)
     try:
-        # CSV 파일 로드 (한글 깨짐 방지를 위해 encoding='cp949' 또는 'utf-8-sig' 시도 권장)
-        # 예시 데이터 구조: road_name(장소명), lat(위도), lon(경도), risk_score(위험도)
-        df = pd.read_csv('20251229road_최종.csv')
-        
-        # 필수 컬럼 확인 및 예외처리
-        required_cols = ['lat', 'lon']
-        for col in required_cols:
-            if col not in df.columns:
-                st.error(f"데이터 파일에 '{col}' 컬럼이 없습니다.")
-                return pd.DataFrame()
-
-        # 장소 이름 컬럼이 없으면 임의로 생성 (실제 데이터에 'road_name'이 있다면 이 부분은 건너뜀)
-        if 'road_name' not in df.columns:
-            # 테스트를 위해 임시 이름 생성 (실제 사용시에는 데이터에 이름 컬럼이 있어야 함)
-            df['road_name'] = [f"지점_{i}" for i in range(len(df))]
-        
-        # 위험도 컬럼이 없으면 임의 생성
-        if 'risk_score' not in df.columns:
-            import numpy as np
-            df['risk_score'] = np.random.randint(1, 100, df.shape[0])
-            
-        return df
+        # 한국 공공데이터는 주로 cp949 또는 euc-kr 사용
+        df = pd.read_csv(file_path, encoding='cp949')
+    except UnicodeDecodeError:
+        try:
+            df = pd.read_csv(file_path, encoding='utf-8')
+        except:
+            st.error("파일 인코딩 형식을 알 수 없습니다. (cp949, utf-8 실패)")
+            return pd.DataFrame()
     except FileNotFoundError:
-        st.error("데이터 파일(20251229road_최종.csv)을 찾을 수 없습니다. 폴더에 업로드 해주세요.")
+        st.error(f"'{file_path}' 파일을 찾을 수 없습니다. 폴더에 파일이 있는지 확인해주세요.")
         return pd.DataFrame()
-    except Exception as e:
-        st.error(f"데이터 로드 중 오류 발생: {e}")
+
+    # 2. 컬럼명 자동 매핑 (핵심 수정 사항)
+    # 데이터의 컬럼명이 무엇이든 lat, lon, road_name으로 통일시킴
+    column_mapping = {
+        '위도': 'lat', 'latitude': 'lat', 'Lat': 'lat', 'LAT': 'lat',
+        '경도': 'lon', 'longitude': 'lon', 'Lon': 'lon', 'LON': 'lon',
+        '장소명': 'road_name', '도로명': 'road_name', '지점명': 'road_name', '이름': 'road_name',
+        '위험도': 'risk_score', '위험지수': 'risk_score'
+    }
+    
+    # 실제 데이터에 있는 컬럼만 rename 적용
+    df = df.rename(columns=column_mapping)
+
+    # 3. 필수 데이터 확인
+    if 'lat' not in df.columns or 'lon' not in df.columns:
+        st.error("🚨 오류: 데이터 파일에서 위도/경도 정보를 찾을 수 없습니다.")
+        st.write("현재 파일의 컬럼 목록:", df.columns.tolist())
+        st.write("위도/경도 컬럼 이름을 'lat', 'lon' 또는 '위도', '경도'로 변경해주세요.")
         return pd.DataFrame()
+
+    # road_name 없으면 임의 생성
+    if 'road_name' not in df.columns:
+        df['road_name'] = [f"지점_{i}" for i in range(len(df))]
+    
+    # risk_score 없으면 임의 생성 (0~100)
+    if 'risk_score' not in df.columns:
+        import numpy as np
+        df['risk_score'] = np.random.randint(1, 100, size=len(df))
+
+    return df
 
 df = load_data()
 
-# 위험도 수치를 단계로 변환하는 함수
 def get_risk_level(score):
-    if score < 30:
-        return "안전 (Green)", "green"
-    elif score < 70:
-        return "주의 (Orange)", "orange"
-    else:
-        return "위험 (Red)", "red"
+    if score < 30: return "안전", "green"
+    elif score < 70: return "주의", "orange"
+    else: return "위험", "red"
 
 # ---------------------------------------------------------
-# 3. 사이드바: 장소 선택 및 모드 설정
+# 3. 사이드바 UI
 # ---------------------------------------------------------
-st.sidebar.header("📍 경로 탐색 설정")
+st.sidebar.header("📍 설정")
 
-# 모드 선택
-mode = st.sidebar.radio(
-    "이동 모드 선택",
-    ("🚗 자동차 모드 (도로 위주)", "🚶 보행자 모드 (최단/안전)")
-)
-
-# [핵심 변경] 데이터에서 장소 목록 추출 (중복 제거 및 정렬)
 if not df.empty:
-    location_list = sorted(df['road_name'].unique().tolist())
+    # 데이터 미리보기 (디버깅용 - 필요 없으면 주석 처리)
+    with st.expander("데이터 원본 보기 (상위 5개)"):
+        st.dataframe(df.head())
+
+    mode = st.sidebar.radio("모드 선택", ("🚗 자동차 모드", "🚶 보행자 모드"))
     
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("출발지/도착지 선택")
-    st.sidebar.caption("💡 목록을 클릭하고 키보드로 이름을 입력하면 빠르게 검색됩니다.")
+    # 장소 목록 (가나다순 정렬)
+    # 문자열로 확실히 변환 후 정렬
+    location_list = sorted([str(x) for x in df['road_name'].unique()])
     
-    # selectbox를 사용하여 검색 기능 제공
-    start_point_name = st.sidebar.selectbox("출발지 선택", location_list, index=0)
-    # 도착지는 출발지와 다른 곳을 기본값으로 하기 위해 index=1 (데이터가 2개 이상일 때)
-    default_end_index = 1 if len(location_list) > 1 else 0
-    end_point_name = st.sidebar.selectbox("도착지 선택", location_list, index=default_end_index)
+    start_point_name = st.sidebar.selectbox("출발지", location_list, index=0)
     
-    search_btn = st.sidebar.button("경로 분석 시작")
+    # 도착지 기본값 설정 로직
+    default_end_idx = 1 if len(location_list) > 1 else 0
+    end_point_name = st.sidebar.selectbox("도착지", location_list, index=default_end_idx)
+    
+    search_btn = st.sidebar.button("경로 탐색")
 else:
-    st.sidebar.error("데이터가 없습니다.")
-    start_point_name = None
-    end_point_name = None
-    search_btn = False
+    st.stop() # 데이터 없으면 여기서 멈춤
 
 # ---------------------------------------------------------
-# 4. 메인 로직: 선택된 장소 좌표 찾기 및 지도 표출
+# 4. 지도 및 분석 로직
 # ---------------------------------------------------------
-
-# 기본 지도 (대한민국 중심)
 m = folium.Map(location=[36.5, 127.5], zoom_start=7)
 
-if search_btn and not df.empty:
+if search_btn:
     if start_point_name == end_point_name:
-        st.warning("출발지와 도착지가 같습니다. 다른 장소를 선택해주세요.")
+        st.warning("출발지와 도착지가 동일합니다.")
     else:
-        # 데이터프레임에서 선택된 이름에 해당하는 좌표 정보 가져오기
+        # 선택한 장소의 데이터 행 추출
         start_row = df[df['road_name'] == start_point_name].iloc[0]
         end_row = df[df['road_name'] == end_point_name].iloc[0]
         
-        start_coords = (start_row['lat'], start_row['lon'])
-        end_coords = (end_row['lat'], end_row['lon'])
+        start_coords = [start_row['lat'], start_row['lon']]
+        end_coords = [end_row['lat'], end_row['lon']]
+        
+        # 지도 중심 이동
+        mid_lat = (start_coords[0] + end_coords[0]) / 2
+        mid_lon = (start_coords[1] + end_coords[1]) / 2
+        m.location = [mid_lat, mid_lon]
+        m.zoom_start = 12
 
-        with st.spinner(f"'{start_point_name}'에서 '{end_point_name}'까지 경로 분석 중..."):
-            
-            # 1. 지도 중심 이동
-            mid_lat = (start_coords[0] + end_coords[0]) / 2
-            mid_lon = (start_coords[1] + end_coords[1]) / 2
-            m.location = [mid_lat, mid_lon]
-            m.zoom_start = 12
-
-            # 2. 마커 추가 (데이터에 있는 정확한 위치)
-            folium.Marker(
-                start_coords, 
-                popup=f"출발: {start_point_name}", 
-                tooltip="출발지",
-                icon=folium.Icon(color="blue", icon="play")
-            ).add_to(m)
-            
-            folium.Marker(
-                end_coords, 
-                popup=f"도착: {end_point_name}", 
-                tooltip="도착지",
-                icon=folium.Icon(color="red", icon="stop")
-            ).add_to(m)
-
-            # 3. 경로 그리기 (직선 시각화)
-            line_color = "blue" if "자동차" in mode else "green"
-            folium.PolyLine(
-                locations=[start_coords, end_coords],
-                color=line_color,
-                weight=5,
-                dash_array='10' if "보행자" in mode else None,
-                opacity=0.7
-            ).add_to(m)
-
-            # 4. 주변 위험 데이터 시각화 (범위 필터링)
-            # 출발-도착 좌표를 포함하는 사각형 영역 설정
-            lat_min, lat_max = min(start_coords[0], end_coords[0]), max(start_coords[0], end_coords[0])
-            lon_min, lon_max = min(start_coords[1], end_coords[1]), max(start_coords[1], end_coords[1])
-            
-            # 검색 범위 여유값 (버퍼)
-            buffer = 0.02  
-            mask = (df['lat'] >= lat_min - buffer) & (df['lat'] <= lat_max + buffer) & \
-                   (df['lon'] >= lon_min - buffer) & (df['lon'] <= lon_max + buffer)
-            nearby_data = df[mask]
-
-            count_danger = 0
+        # 1. 출발/도착 마커
+        folium.Marker(start_coords, popup=f"출발: {start_point_name}", icon=folium.Icon(color="blue", icon="play")).add_to(m)
+        folium.Marker(end_coords, popup=f"도착: {end_point_name}", icon=folium.Icon(color="red", icon="stop")).add_to(m)
+        
+        # 2. 경로 선 그리기
+        color = "blue" if "자동차" in mode else "green"
+        style = None if "자동차" in mode else "10"
+        folium.PolyLine([start_coords, end_coords], color=color, weight=5, dash_array=style).add_to(m)
+        
+        # 3. 위험도 오버레이 (범위 필터링)
+        lats = [start_coords[0], end_coords[0]]
+        lons = [start_coords[1], end_coords[1]]
+        buffer = 0.03
+        
+        # 지도에 표시될 범위 내의 데이터만 가져옴
+        mask = (df['lat'] >= min(lats)-buffer) & (df['lat'] <= max(lats)+buffer) & \
+               (df['lon'] >= min(lons)-buffer) & (df['lon'] <= max(lons)+buffer)
+        sub_df = df[mask]
+        
+        count = 0
+        for i, row in sub_df.iterrows():
+            # 출발/도착지는 이미 마커가 있으므로 제외
+            if row['road_name'] in [start_point_name, end_point_name]:
+                continue
+                
+            lvl_text, lvl_color = get_risk_level(row['risk_score'])
             
             if "자동차" in mode:
-                # 자동차: 모든 위험 요소 표시
-                for idx, row in nearby_data.iterrows():
-                    level_text, color = get_risk_level(row['risk_score'])
-                    # 출발/도착지는 제외하고 표시
-                    if row['road_name'] not in [start_point_name, end_point_name]:
-                        folium.CircleMarker(
-                            location=[row['lat'], row['lon']],
-                            radius=6,
-                            color=color,
-                            fill=True,
-                            fill_opacity=0.7,
-                            popup=f"{row['road_name']} (위험도: {level_text})"
-                        ).add_to(m)
-                        if color == "red": count_danger += 1
+                # 자동차: 모든 포인트 표시
+                folium.CircleMarker(
+                    location=[row['lat'], row['lon']], radius=5, color=lvl_color, fill=True, fill_color=lvl_color,
+                    popup=f"{row['road_name']}: {lvl_text}"
+                ).add_to(m)
             else:
-                # 보행자: 고위험 지역만 경고 표시
-                high_risks = nearby_data[nearby_data['risk_score'] >= 70]
-                for idx, row in high_risks.iterrows():
-                    if row['road_name'] not in [start_point_name, end_point_name]:
-                        folium.Marker(
-                            location=[row['lat'], row['lon']],
-                            icon=folium.Icon(color="red", icon="exclamation-sign"),
-                            tooltip=f"주의: {row['road_name']}"
-                        ).add_to(m)
-                        count_danger += 1
-
-            if count_danger > 0:
-                st.toast(f"경로 주변에 주의할 구간이 {count_danger}곳 있습니다!", icon="⚠️")
+                # 보행자: 위험(Red)만 경고 마커
+                if lvl_color == "red":
+                    folium.Marker(
+                        location=[row['lat'], row['lon']], 
+                        icon=folium.Icon(color="red", icon="exclamation-sign"),
+                        tooltip=f"위험: {row['road_name']}"
+                    ).add_to(m)
+                    count += 1
+        
+        if "보행자" in mode and count > 0:
+            st.warning(f"경로 주변에 보행자 위험 구간이 {count}곳 있습니다.")
 
 # 지도 출력
-st_data = st_folium(m, width="100%", height=600)
+st_folium(m, width="100%", height=600)
 
-# ---------------------------------------------------------
-# 5. 하단 분석 정보
-# ---------------------------------------------------------
+# 하단 정보
 if search_btn and not df.empty:
     st.markdown("---")
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        st.info(f"📍 **출발**: {start_point_name}")
-    with col2:
-        st.success(f"🚩 **도착**: {end_point_name}")
-    with col3:
-        # 거리 계산 (Haversine 공식 대신 간단한 유클리드 거리 근사치 사용)
-        dist = math.sqrt((start_coords[0]-end_coords[0])**2 + (start_coords[1]-end_coords[1])**2) * 111
-        st.metric(label="직선 거리", value=f"{dist:.2f} km")
-
-    # 출발/도착지의 안전 정보 표시
-    s_score = start_row['risk_score']
-    e_score = end_row['risk_score']
-    
-    st.subheader("지점별 안전 등급")
-    c1, c2 = st.columns(2)
-    c1.markdown(f"**출발지 안전도**: {get_risk_level(s_score)[0]}")
-    c2.markdown(f"**도착지 안전도**: {get_risk_level(e_score)[0]}")
+    dist = math.sqrt((start_coords[0]-end_coords[0])**2 + (start_coords[1]-end_coords[1])**2) * 111
+    st.metric("예상 거리 (직선)", f"{dist:.2f} km")
