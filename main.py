@@ -1,177 +1,236 @@
 import streamlit as st
 import pandas as pd
+import osmnx as ox
+import networkx as nx
 import folium
 from streamlit_folium import st_folium
-import math
-import os
+from geopy.geocoders import Nominatim
+from geopy.exc import GeocoderTimedOut
+from scipy.spatial import cKDTree
+import numpy as np
 
 # ---------------------------------------------------------
-# 1. 페이지 설정 및 제목
+# 1. 설정 및 데이터 로드
 # ---------------------------------------------------------
-st.set_page_config(
-    page_title="Road Insight - 안전 경로 탐색",
-    page_icon="🚗",
-    layout="wide"
-)
+st.set_page_config(page_title="안전 경로 네비게이터", layout="wide")
 
-st.title("🛣️ Road Insight")
-st.markdown("""
-**최단 거리 및 도로 안전 정보 제공 시스템** 자동차와 보행자에게 최적의 경로와 도로 위험도 정보를 제공합니다.
-""")
-
-# ---------------------------------------------------------
-# 2. 데이터 로드 및 전처리 함수
-# ---------------------------------------------------------
 @st.cache_data
 def load_data(file_path):
-    # 파일 존재 여부 디버깅용 출력
+    """
+    사용자의 도로 안전 데이터를 로드합니다.
+    파일이 없을 경우를 대비한 예외처리가 포함되어 있습니다.
+    """
     if not os.path.exists(file_path):
-        return None
-
+        st.error(f"데이터 파일({file_path})을 찾을 수 없습니다. 같은 폴더에 위치시켜주세요.")
+        # 테스트를 위한 더미 데이터 생성 (실제 배포시 삭제 가능)
+        return pd.DataFrame({
+            'lat': [37.5665, 37.5660, 37.5700], 
+            'lon': [126.9780, 126.9800, 126.9750], 
+            'risk_score': [80, 20, 50],
+            'desc': ['사고 다발 구간', '안전 구간', '주의 구간']
+        })
+    
     try:
-        # 인코딩: 윈도우(cp949) 또는 맥/리눅스(utf-8) 시도
-        try:
-            df = pd.read_csv(file_path, encoding='cp949')
-        except UnicodeDecodeError:
-            df = pd.read_csv(file_path, encoding='utf-8')
-        
-        # 전처리: 좌표가 문자로 되어있거나 #N/A인 경우를 대비해 숫자로 강제 변환
-        df['x좌표'] = pd.to_numeric(df['x좌표'], errors='coerce')
-        df['y좌표'] = pd.to_numeric(df['y좌표'], errors='coerce')
-        
-        # 좌표(x, y)가 둘 다 있는 행만 남기기 (지도 표시에 필수)
-        df_clean = df.dropna(subset=['x좌표', 'y좌표']).copy()
-        
-        # 인덱스 초기화
-        df_clean.reset_index(drop=True, inplace=True)
-        
-        return df_clean
-
+        df = pd.read_csv(file_path)
+        # 컬럼명 매핑 (사용자의 CSV 컬럼명에 맞게 수정 필요)
+        # 예: 만약 CSV에 '위도', '경도'로 되어있다면 rename 필요
+        # df = df.rename(columns={'위도': 'lat', '경도': 'lon', '위험도': 'risk_score'})
+        return df
     except Exception as e:
-        st.error(f"데이터를 불러오는 중 에러가 발생했습니다: {e}")
+        st.error(f"데이터 로드 중 오류 발생: {e}")
         return pd.DataFrame()
 
-# ✅ 수정된 부분: 깃허브에 올린 파일명과 정확히 일치시킴
-DATA_FILE = '20251229road_최종.csv'
-df = load_data(DATA_FILE)
+# 데이터 파일 이름 (사용자 지정)
+DATA_FILE = "20251229road_29최종.csv"
+risk_data = load_data(DATA_FILE)
+
+# 지오코더 설정 (주소 -> 좌표 변환)
+geolocator = Nominatim(user_agent="safe_route_app_kr")
 
 # ---------------------------------------------------------
-# 3. 데이터 로드 실패 시 중단
+# 2. 유틸리티 함수 (좌표변환, 그래프 다운로드)
 # ---------------------------------------------------------
-if df is None:
-    st.error(f"❌ '{DATA_FILE}' 파일을 찾을 수 없습니다.")
-    st.warning(f"현재 폴더에 '{DATA_FILE}' 파일이 있는지 확인해주세요. (파일명의 띄어쓰기나 '최종' 글자를 확인하세요)")
-    st.stop()
+def get_coordinates(address):
+    """주소를 입력받아 (위도, 경도)를 반환합니다. 한국 한정 검색."""
+    try:
+        # 정확도를 위해 'South Korea'를 검색어에 추가
+        loc = geolocator.geocode(f"{address}, South Korea", timeout=10)
+        if loc:
+            return loc.latitude, loc.longitude
+        return None
+    except (GeocoderTimedOut, Exception):
+        return None
 
-if df.empty:
-    st.warning("⚠️ 유효한 좌표 데이터가 없습니다. CSV 파일의 'x좌표', 'y좌표' 컬럼이 비어있지 않은지 확인해주세요.")
-    st.stop()
+@st.cache_resource
+def get_graph(start_coords, end_coords, mode):
+    """
+    출발지와 도착지를 포함하는 범위의 도로망 그래프를 다운로드합니다.
+    Streamlit Cloud 메모리 절약을 위해 전체 지도가 아닌 Bounding Box만 가져옵니다.
+    """
+    # 여유 반경 설정 (단위: degree, 약 0.01 ~ 1km)
+    margin = 0.01 
+    north = max(start_coords[0], end_coords[0]) + margin
+    south = min(start_coords[0], end_coords[0]) - margin
+    east = max(start_coords[1], end_coords[1]) + margin
+    west = min(start_coords[1], end_coords[1]) - margin
+
+    network_type = 'drive' if mode == '자동차 모드' else 'walk'
+    
+    try:
+        # 사용자 정의 필터로 그래프 다운로드 (bbox 방식)
+        G = ox.graph_from_bbox(north, south, east, west, network_type=network_type, simplify=True)
+        return G
+    except Exception as e:
+        return None
+
+def match_risk_data(G, route, risk_df):
+    """
+    계산된 경로 주변의 위험도 데이터를 매칭합니다.
+    경로상의 노드와 CSV 데이터의 가장 가까운 점을 찾습니다.
+    """
+    if risk_df.empty or route is None:
+        return []
+
+    # 경로상의 노드 좌표 추출
+    route_nodes = []
+    for node_id in route:
+        node = G.nodes[node_id]
+        route_nodes.append((node['y'], node['x'])) # lat, lon
+
+    # CSV 데이터 좌표 KDTree 생성 (빠른 검색용)
+    if 'lat' in risk_df.columns and 'lon' in risk_df.columns:
+        data_coords = list(zip(risk_df['lat'], risk_df['lon']))
+        tree = cKDTree(data_coords)
+        
+        route_risks = []
+        # 각 경로 포인트에서 가장 가까운 위험 데이터 찾기 (반경 50m 이내)
+        dists, idxs = tree.query(route_nodes, k=1, distance_upper_bound=0.0005) # 약 50m
+        
+        for i, (dist, idx) in enumerate(zip(dists, idxs)):
+            if dist != float('inf'): # 매칭된 데이터가 있으면
+                info = risk_df.iloc[idx]
+                route_risks.append({
+                    'lat': route_nodes[i][0],
+                    'lon': route_nodes[i][1],
+                    'risk': info.get('risk_score', 0),
+                    'desc': info.get('desc', '정보 없음')
+                })
+        return route_risks
+    return []
 
 # ---------------------------------------------------------
-# 4. 사이드바: 모드 선택 및 경로 설정
+# 3. UI 및 메인 로직
 # ---------------------------------------------------------
-st.sidebar.header("⚙️ 설정")
+st.title("🚗🛡️ 안전 경로 네비게이터 (South Korea)")
+st.markdown("""
+이 앱은 **최단 거리**를 기반으로 하되, 도로의 **안전 정보(위험도)**를 함께 시각화하여 
+운전자와 보행자의 안전한 이동을 돕습니다.
+""")
 
-mode = st.sidebar.radio(
-    "이동 모드 선택",
-    ("🚗 자동차 모드 (Car)", "🚶 보행자 모드 (Walk)")
-)
+# 사이드바: 입력 컨트롤
+st.sidebar.header("설정 및 입력")
+mode = st.sidebar.radio("이동 수단 선택", ["자동차 모드", "보행자 모드"])
 
-# 노드 선택 옵션 생성 (이름 + ID)
-node_options = df.apply(lambda row: f"{row['노드명']} (ID:{row['노드id']})", axis=1).tolist()
+start_input = st.sidebar.text_input("출발지 (예: 서울역)", "서울시청")
+end_input = st.sidebar.text_input("도착지 (예: 강남역)", "광화문")
 
-st.sidebar.subheader("경로 탐색")
-start_node_str = st.sidebar.selectbox("출발지 선택", node_options)
-# 목적지는 기본적으로 리스트의 마지막 항목으로 설정
-end_node_str = st.sidebar.selectbox("목적지 선택", node_options, index=len(node_options)-1 if len(node_options)>1 else 0)
+search_btn = st.sidebar.button("경로 탐색 시작")
 
-# 선택된 항목의 인덱스 찾기
-start_idx = node_options.index(start_node_str)
-end_idx = node_options.index(end_node_str)
-
-start_row = df.iloc[start_idx]
-end_row = df.iloc[end_idx]
-
-# ---------------------------------------------------------
-# 5. 메인 기능: 지도 시각화 및 정보 표시
-# ---------------------------------------------------------
-col1, col2 = st.columns([3, 1])
-
+# 설명 영역
+col1, col2 = st.columns(2)
 with col1:
-    st.subheader(f"🗺️ 경로 안내 ({mode})")
-    
-    # 지도 중심: 출발지와 목적지의 중간
-    center_lat = (start_row['y좌표'] + end_row['y좌표']) / 2
-    center_lon = (start_row['x좌표'] + end_row['x좌표']) / 2
-    
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=14)
-
-    # 출발지 마커
-    folium.Marker(
-        [start_row['y좌표'], start_row['x좌표']],
-        popup=f"출발: {start_row['노드명']}",
-        tooltip="출발지",
-        icon=folium.Icon(color='blue', icon='play')
-    ).add_to(m)
-
-    # 목적지 마커
-    folium.Marker(
-        [end_row['y좌표'], end_row['x좌표']],
-        popup=f"도착: {end_row['노드명']}",
-        tooltip="목적지",
-        icon=folium.Icon(color='red', icon='flag')
-    ).add_to(m)
-
-    # 경로 스타일 설정
-    line_color = 'blue' if "Car" in mode else 'green'
-    line_style = 'solid' if "Car" in mode else 'dashed'
-
-    locations = [
-        [start_row['y좌표'], start_row['x좌표']],
-        [end_row['y좌표'], end_row['x좌표']]
-    ]
-    
-    folium.PolyLine(
-        locations,
-        color=line_color,
-        weight=5,
-        opacity=0.8,
-        dash_array='10' if line_style == 'dashed' else None,
-        tooltip=f"{mode} 경로"
-    ).add_to(m)
-
-    # 스트림릿에 지도 그리기
-    st_folium(m, width="100%", height=500)
-
-with col2:
-    st.subheader("ℹ️ 상세 정보")
-    
-    # 단순 거리 계산 (유클리드 거리 예시)
-    dist_val = math.sqrt((start_row['x좌표']-end_row['x좌표'])**2 + (start_row['y좌표']-end_row['y좌표'])**2)
-    
-    if start_node_str == end_node_str:
-        st.error("출발지와 목적지가 같습니다.")
+    st.info(f"**현재 모드:** {mode}")
+    if mode == '자동차 모드':
+        st.write("🛣️ 차량 진입 가능 도로 위주 안내 + 도로 위험도 표시")
     else:
-        st.success("경로 탐색 완료")
-
-    st.markdown("---")
-    st.write(f"**📍 목적지: {end_row['노드명']}**")
-    
-    risk = end_row.get('교차로위험수준', '정보 없음')
-    grade = end_row.get('교차로안전등급', '정보 없음')
-    
-    st.metric(label="안전 등급", value=str(grade))
-    st.metric(label="위험도 수치", value=str(risk))
-
-    if "Car" in mode:
-        st.warning("🚗 운전자 주의")
-        st.caption("해당 도로는 차량 통행이 많을 수 있습니다. 안전 거리를 확보하세요.")
-    else:
-        st.info("🚶 보행자 팁")
-        st.caption("횡단보도 이용 시 주변을 잘 살피세요.")
+        st.write("🚶 인도, 횡단보도 포함 최단 거리 + 보행자 안전 정보")
 
 # ---------------------------------------------------------
-# 6. 하단 데이터 확인용 (접기/펴기)
+# 4. 경로 탐색 실행
 # ---------------------------------------------------------
-with st.expander("📊 원본 데이터 확인하기"):
-    st.dataframe(df)
+if search_btn:
+    with st.spinner('위치 정보를 확인하고 경로를 계산 중입니다...'):
+        # 1. 지오코딩
+        start_coords = get_coordinates(start_input)
+        end_coords = get_coordinates(end_input)
+
+        if not start_coords or not end_coords:
+            st.error("❌ 출발지 또는 도착지의 위치를 찾을 수 없습니다. 정확한 도로명 주소나 주요 건물명을 입력해주세요.")
+        else:
+            # 2. 그래프 다운로드 및 경로 계산
+            G = get_graph(start_coords, end_coords, mode)
+            
+            if G is None:
+                st.error("⚠️ 해당 지역의 도로 정보를 가져올 수 없거나 너무 먼 거리입니다. (메모리 제한으로 인해 가까운 지역만 검색 가능)")
+            else:
+                # 시작/종료점의 가장 가까운 노드 찾기
+                orig_node = ox.distance.nearest_nodes(G, start_coords[1], start_coords[0])
+                dest_node = ox.distance.nearest_nodes(G, end_coords[1], end_coords[0])
+
+                try:
+                    # 최단 경로 계산 (Dijkstra)
+                    route = nx.shortest_path(G, orig_node, dest_node, weight='length')
+                    
+                    # 경로 길이 계산
+                    route_len = nx.path_weight(G, route, weight='length')
+                    
+                    # 3. 위험도 매칭
+                    matched_risks = match_risk_data(G, route, risk_data)
+
+                    # 4. 지도 시각화
+                    m = folium.Map(location=start_coords, zoom_start=14)
+                    
+                    # 경로 그리기
+                    # 자동차는 파란색 실선, 보행자는 초록색 점선 스타일
+                    line_color = 'blue' if mode == '자동차 모드' else 'green'
+                    line_style = '10, 10' if mode == '보행자 모드' else None
+                    
+                    ox.plot_route_folium(G, route, m, color=line_color, weight=5, opacity=0.7, dash_array=line_style)
+
+                    # 출발/도착 마커
+                    folium.Marker(start_coords, tooltip="출발", icon=folium.Icon(color='green', icon='play')).add_to(m)
+                    folium.Marker(end_coords, tooltip="도착", icon=folium.Icon(color='red', icon='stop')).add_to(m)
+
+                    # 5. 위험/안전 정보 오버레이 (성공 지표 시각화)
+                    safe_count = 0
+                    danger_count = 0
+                    
+                    for info in matched_risks:
+                        risk = info['risk']
+                        # 위험도가 높으면 빨간 원, 낮으면 파란 원
+                        color = 'red' if risk >= 50 else 'blue'
+                        radius = 10 if risk >= 50 else 5
+                        
+                        if risk >= 50: danger_count += 1
+                        else: safe_count += 1
+
+                        folium.CircleMarker(
+                            location=[info['lat'], info['lon']],
+                            radius=radius,
+                            color=color,
+                            fill=True,
+                            fill_color=color,
+                            tooltip=f"위험도: {risk} / {info['desc']}"
+                        ).add_to(m)
+
+                    # 결과 출력
+                    st.success(f"✅ 경로 탐색 완료! (총 거리: {route_len/1000:.2f} km)")
+                    
+                    # 통계 지표
+                    st.metric(label="탐지된 위험/주의 구간 수", value=f"{danger_count} 곳")
+                    
+                    if danger_count > 0:
+                        st.warning("⚠️ 경로 상에 주의가 필요한 구간이 있습니다. 지도상의 빨간 점을 확인하세요.")
+
+                    # 지도 표시
+                    st_folium(m, width=725, height=500)
+
+                except nx.NetworkXNoPath:
+                    st.error("❌ 경로를 찾을 수 없습니다. (도로가 연결되어 있지 않거나 너무 먼 거리)")
+                except Exception as e:
+                    st.error(f"❌ 시스템 오류 발생: {e}")
+
+else:
+    # 초기 화면 지도 표시 (서울 중심)
+    m_default = folium.Map(location=[37.5665, 126.9780], zoom_start=11)
+    st_folium(m_default, width=725, height=500)
